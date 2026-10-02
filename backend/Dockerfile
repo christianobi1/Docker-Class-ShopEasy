@@ -8,7 +8,8 @@ RUN npm install -g npm@latest && cd $(npm root -g)/npm && npm install brace-expa
 COPY package*.json ./
 RUN npm install
 
-COPY . .
+COPY server.js db.js redisClient.js ./
+COPY routes ./routes
 
 RUN chown -R node:node /app
 
