@@ -12,6 +12,8 @@ spec:
       labels:
         app: redis
     spec:
+      securityContext:
+        runAsNonRoot: true
       containers:
         - name: redis
           image: redis:7.4-alpine
