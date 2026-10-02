@@ -2,8 +2,13 @@ FROM node:20
 
 WORKDIR /app
 
+COPY package*.json ./
+RUN npm install
+
 COPY . .
 
-RUN npm install
+RUN chown -R node:node /app
+
+USER node
 
 CMD ["node", "server.js"]
