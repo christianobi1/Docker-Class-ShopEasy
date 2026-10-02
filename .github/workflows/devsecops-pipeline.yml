@@ -1,0 +1,227 @@
+name: ShopEasy DevSecOps Pipeline
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  security-and-build:
+    name: Security Scan & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------
+      # 1. SonarQube code analysis
+      # -----------------------------
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=shopeasy-backend
+            -Dsonar.sources=backend
+
+      # -----------------------------
+      # 2. SonarQube Quality Gate
+      # -----------------------------
+      - name: SonarQube Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
+        with:
+          pollingTimeoutSec: 600
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # -----------------------------
+      # 3. Trivy filesystem scan
+      # -----------------------------
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # -----------------------------
+      # 4. Build Docker images
+      # -----------------------------
+      - name: Build backend image
+        run: |
+          docker build \
+            -t "$DOCKERHUB_USERNAME/shopeasy-backend:$IMAGE_TAG" \
+            ./backend
+
+      - name: Build frontend image
+        run: |
+          docker build \
+            -t "$DOCKERHUB_USERNAME/shopeasy-frontend:$IMAGE_TAG" \
+            ./frontend
+
+      # -----------------------------
+      # 5. Trivy backend image scan
+      # -----------------------------
+      - name: Trivy backend image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.DOCKERHUB_USERNAME }}/shopeasy-backend:${{ env.IMAGE_TAG }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # -----------------------------
+      # 6. Trivy frontend image scan
+      # -----------------------------
+      - name: Trivy frontend image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.DOCKERHUB_USERNAME }}/shopeasy-frontend:${{ env.IMAGE_TAG }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # -----------------------------
+      # 7. Login to Docker Hub
+      # -----------------------------
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # -----------------------------
+      # 8. Push images
+      # -----------------------------
+      - name: Push backend image
+        run: |
+          docker push "$DOCKERHUB_USERNAME/shopeasy-backend:$IMAGE_TAG"
+
+      - name: Push frontend image
+        run: |
+          docker push "$DOCKERHUB_USERNAME/shopeasy-frontend:$IMAGE_TAG"
+
+  deploy:
+    name: Deploy to EC2
+    needs: security-and-build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------
+      # 9. Configure AWS
+      # -----------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # -----------------------------
+      # 10. Retrieve DB password
+      # -----------------------------
+      - name: Retrieve database password
+        id: db-secret
+        shell: bash
+        run: |
+          DB_PASSWORD=$(aws secretsmanager get-secret-value \
+            --secret-id shopeasy/db-password \
+            --query SecretString \
+            --output text)
+
+          echo "::add-mask::$DB_PASSWORD"
+          echo "DB_PASSWORD=$DB_PASSWORD" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------
+      # 11. Copy Compose file
+      # -----------------------------
+      - name: Copy docker-compose.yml to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          source: "docker-compose.yml"
+          target: "/opt/shopeasy"
+
+      # -----------------------------
+      # 12. Deploy application
+      # -----------------------------
+      - name: Deploy ShopEasy
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DB_PASSWORD: ${{ steps.db-secret.outputs.DB_PASSWORD }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_TAG: ${{ github.sha }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          envs: DB_PASSWORD,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,IMAGE_TAG
+          script: |
+            set -e
+
+            cd /opt/shopeasy
+            mkdir -p backend
+
+            # Generate a separate Redis password on the EC2 server.
+            if [ -f /opt/shopeasy/.redis_password ]; then
+              REDIS_PASSWORD=$(cat /opt/shopeasy/.redis_password)
+            else
+              REDIS_PASSWORD=$(openssl rand -hex 32)
+              echo "$REDIS_PASSWORD" > /opt/shopeasy/.redis_password
+              chmod 600 /opt/shopeasy/.redis_password
+            fi
+
+            cat > .env <<EOF
+            DB_USER=shopeasy_user
+            DB_PASSWORD=${DB_PASSWORD}
+            DB_NAME=shopeasy
+            REDIS_PASSWORD=${REDIS_PASSWORD}
+            DOCKERHUB_USERNAME=${DOCKERHUB_USERNAME}
+            IMAGE_TAG=${IMAGE_TAG}
+            EOF
+
+            cat > backend/.env <<EOF
+            PORT=5000
+            NODE_ENV=production
+            CORS_ORIGIN=http://${{ secrets.DEPLOY_HOST }}
+            DB_HOST=postgres
+            DB_PORT=5432
+            DB_USER=shopeasy_user
+            DB_PASSWORD=${DB_PASSWORD}
+            DB_NAME=shopeasy
+            REDIS_HOST=redis
+            REDIS_PORT=6379
+            REDIS_PASSWORD=${REDIS_PASSWORD}
+            EOF
+
+            echo "$DOCKERHUB_TOKEN" | docker login \
+              --username "$DOCKERHUB_USERNAME" \
+              --password-stdin
+
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+            docker image prune -f
